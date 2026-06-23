@@ -25,8 +25,10 @@ from sv_filter import SVParams, simulate_sv
 from pmmh import pmmh, summarize
 from risk_engine import sv_risk_forecast, ewma_risk_forecast, backtest_report
 
-BINANCE_URL = "https://api.binance.com/api/v3/klines"
+BINANCE_URL = "https://api.binance.com/api/v3/klines"          # geo-blocked (451) from US IPs
+COINBASE_URL = "https://api.exchange.coinbase.com/products/{product}/candles"
 _INTERVAL_MS = {"1h": 3_600_000, "1m": 60_000, "1d": 86_400_000}
+_GRANULARITY = {"1h": 3600, "1m": 60, "1d": 86400}             # Coinbase, seconds
 
 
 # --------------------------------------------------------------------------- #
@@ -64,6 +66,50 @@ def fetch_binance_klines(symbol="BTCUSDT", interval="1h",
             break
         time.sleep(pause)                            # be polite to the API
     return np.asarray(times), np.asarray(closes)
+
+
+def fetch_coinbase_candles(product="BTC-USD", interval="1h",
+                           start_ms=None, end_ms=None, pause=0.25):
+    """
+    Public Coinbase Exchange candles (no key, no US geo-block).
+
+    Returns (close_times_ms, close) -- same shape as fetch_binance_klines, so
+    clean_to_returns and the rest of the pipeline are unchanged.
+
+    Notes: Coinbase returns <= 300 candles/request, DESCENDING, as
+    [time(s), low, high, open, close, volume]; it requires a User-Agent.
+    """
+    import requests
+    from datetime import datetime, timezone
+
+    gran = _GRANULARITY[interval]
+    now_s = int(time.time())
+    end_s = now_s if end_ms is None else end_ms // 1000
+    start_s = (now_s - 365 * 24 * 3600) if start_ms is None else start_ms // 1000
+
+    url = COINBASE_URL.format(product=product)
+    headers = {"User-Agent": "volest/0.1"}
+    window = 300 * gran                                   # max candles per request
+    seen: dict[int, float] = {}
+    cur = start_s
+    while cur < end_s:
+        seg_end = min(cur + window, end_s)
+        params = {
+            "granularity": gran,
+            "start": datetime.fromtimestamp(cur, tz=timezone.utc).isoformat(),
+            "end": datetime.fromtimestamp(seg_end, tz=timezone.utc).isoformat(),
+        }
+        resp = requests.get(url, params=params, headers=headers, timeout=15)
+        resp.raise_for_status()
+        for row in resp.json():                           # [time, low, high, open, close, vol]
+            seen[int(row[0])] = float(row[4])
+        cur = seg_end
+        time.sleep(pause)
+
+    times_s = sorted(seen)
+    close_times_ms = np.array([(t + gran) * 1000 for t in times_s], dtype=float)
+    closes = np.array([seen[t] for t in times_s], dtype=float)
+    return close_times_ms, closes
 
 
 # --------------------------------------------------------------------------- #
@@ -133,13 +179,21 @@ def run(r, train_frac=0.6, pmmh_iter=1000, pmmh_burn=400,
 
 # --------------------------------------------------------------------------- #
 def main():
-    try:
-        print("fetching BTCUSDT 1h from Binance...")
-        t, c = fetch_binance_klines("BTCUSDT", "1h")
-        r, dropped = clean_to_returns(t, c, "1h")
-        print(f"got {r.size} hourly returns ({dropped} dropped across gaps)")
-    except Exception as e:           # restricted network / offline
-        print(f"  fetch unavailable ({type(e).__name__}); using synthetic hourly series")
+    r = None
+    # Coinbase first (no US geo-block); Binance as a fallback for non-US hosts.
+    for label, fetch in (("Coinbase BTC-USD", lambda: fetch_coinbase_candles("BTC-USD", "1h")),
+                         ("Binance BTCUSDT", lambda: fetch_binance_klines("BTCUSDT", "1h"))):
+        try:
+            print(f"fetching {label} 1h ...")
+            t, c = fetch()
+            r, dropped = clean_to_returns(t, c, "1h")
+            print(f"got {r.size} hourly returns ({dropped} dropped across gaps)")
+            break
+        except Exception as e:
+            print(f"  {label} unavailable ({type(e).__name__})")
+
+    if r is None:                    # offline / all sources blocked
+        print("  no live source reachable; using synthetic hourly series")
         truth = SVParams(mu=-9.5, phi=0.97, sigma_eta=0.22, nu=5.0)
         _, r = simulate_sv(truth, n=2500, seed=99)
         print(f"  synthetic truth: {truth}")

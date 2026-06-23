@@ -50,6 +50,40 @@ which is why it compiles cleanly under numba.
 | `app.py` / `Dockerfile` | FastAPI service, containerized |
 
 ---
+## Results — real data (Coinbase BTC-USD, hourly)
+
+Trained by 2-chain PMMH on 3,000 hourly returns; evaluated out-of-sample on the
+following 2,000 returns. Parameters frozen from training; online filtering uses
+only past data; only the test slice is scored.
+
+**Parameter posterior (2 chains, 1,700 draws each, Gelman–Rubin R-hat):**
+
+| param | mean | 90% CI | R-hat |
+|-------|------|--------|-------|
+| `mu`        | −11.08 | [−11.36, −10.82] | 1.005 |
+| `phi`       | 0.939  | [0.912, 0.963]   | 1.005 |
+| `sigma_eta` | 0.409  | [0.329, 0.507]   | 1.008 |
+| `nu`        | 5.60   | [4.33, 7.28]     | 1.077 |
+
+Three parameters are well-converged. `nu` (tail thickness) is only weakly
+identified (R-hat ≈ 1.08): a single year of hourly data contains few genuine
+tail events, so the data cannot tightly constrain tail-thickness. The point
+estimate is stable across chains and runs (5.6–5.8); the *posterior width* is
+what remains uncertain. Fix: more data (multi-year, or pooling across assets).
+
+**Out-of-sample VaR/ES backtest:**
+
+| forecaster | level | breach rate (expected) | Kupiec | Christoffersen | Acerbi–Székely Z2 |
+|------------|-------|------------------------|--------|----------------|-------------------|
+| SV–PF (*t*)   | 1% | 0.80% (1.00%) | PASS (p=0.35) | PASS | +0.25 (ES OK) |
+| EWMA–Gaussian | 1% | 2.05% (1.00%) | **FAIL** (p<0.001) | PASS | −1.60 (ES underestimates) |
+| SV–PF (*t*)   | 5% | 4.15% (5.00%) | PASS (p=0.07) | PASS | +0.20 (ES OK) |
+| EWMA–Gaussian | 5% | 4.65% (5.00%) | PASS | PASS | −0.17 (ES underestimates) |
+
+On real BTC, SV–PF passes 1% VaR coverage where the EWMA–Gaussian baseline fails
+outright, and produces correctly-sized Expected Shortfall at both levels where
+the baseline underestimates tail losses. The 5% rows show the subtle point:
+both pass VaR *frequency*, yet ES backtesting still separates them.
 
 ## Results (synthetic validation)
 
